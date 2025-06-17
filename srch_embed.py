@@ -1,6 +1,6 @@
 import asyncio
 import aiohttp
-from typing import List, Dict, Any, Set
+from typing import List, Dict, Any
 import chromadb
 from ollama import AsyncClient
 import hashlib
@@ -10,10 +10,22 @@ from bs4 import BeautifulSoup
 from duckduckgo_search import DDGS
 from collections import defaultdict
 import random
+import os
+
+# Import search provider utilities
+from multi import (
+    DuckDuckGoProvider,
+    SearxProvider,
+    BraveSearchProvider,
+    SearchProviderManager,
+    RotationStrategy,
+)
 
 
 class KnowledgeAcquisitionPipeline:
-    def __init__(self, topic: str, collection_name: str):
+    def __init__(
+        self, topic: str, collection_name: str, use_multi_provider: bool = True
+    ):
         self.topic = topic
         self.ollama = AsyncClient()
         self.chroma_client = chromadb.PersistentClient(path="./vector_db")
@@ -23,6 +35,29 @@ class KnowledgeAcquisitionPipeline:
         self.processed_urls = set()
         self.knowledge_coverage = defaultdict(int)
         self.search_history = []
+        self.search_manager = None
+
+        if use_multi_provider:
+            self._init_multi_provider_search()
+
+    def _init_multi_provider_search(self):
+        """Initialize multiple search providers"""
+        providers = [DuckDuckGoProvider()]
+
+        # Add a couple of public Searx instances
+        for instance in ["https://searx.be", "https://searx.info"]:
+            try:
+                providers.append(SearxProvider(instance))
+            except Exception as e:
+                print(f"Could not add Searx instance {instance}: {e}")
+
+        brave_key = os.environ.get("BRAVE_SEARCH_API_KEY")
+        if brave_key:
+            providers.append(BraveSearchProvider(brave_key))
+
+        self.search_manager = SearchProviderManager(
+            providers=providers, strategy=RotationStrategy.LEAST_USED
+        )
 
     async def generate_search_queries(self, use_adaptive: bool = True) -> List[str]:
         """Generate search queries, optionally using adaptive strategy"""
@@ -191,7 +226,15 @@ class KnowledgeAcquisitionPipeline:
             return [{"text": content[:1500], "type": "full"}]
 
     async def search_web(self, query: str) -> List[Dict[str, Any]]:
-        """Perform web search and return results"""
+        """Perform web search using available providers"""
+        if self.search_manager:
+            results = await self.search_manager.search(
+                query,
+                max_results=10,
+                use_multiple=len(self.search_history) % 5 == 0,
+            )
+            return [r.to_dict() for r in results]
+
         ddgs = DDGS()
         results = []
 
@@ -202,6 +245,7 @@ class KnowledgeAcquisitionPipeline:
                         "url": result["href"],
                         "title": result["title"],
                         "snippet": result["body"],
+                        "provider": "DuckDuckGo",
                     }
                 )
         except Exception as e:
@@ -333,6 +377,7 @@ class KnowledgeAcquisitionPipeline:
                             "relevance_score": relevance,
                             "timestamp": datetime.now().isoformat(),
                             "search_query": query,
+                            "search_provider": result.get("provider", "Unknown"),
                             "iteration": iteration_count,
                         }
 
